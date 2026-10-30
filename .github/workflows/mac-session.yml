@@ -2,7 +2,7 @@
 # reachable ONLY over the owner's private Tailscale tailnet (no public endpoint).
 #
 # Required repo secrets (Settings > Secrets and variables > Actions):
-#   TS_OAUTH_CLIENT_ID   Tailscale OAuth client id  (scope: auth_keys write, tag:mac-qa)
+#   TS_OAUTH_CLIENT_ID   Tailscale OAuth client id  (scope: auth_keys write, tag:claude-mac)
 #   TS_OAUTH_SECRET      Tailscale OAuth client secret
 #   VNC_PASSWORD         legacy VNC password, EXACTLY 8 chars max (Apple truncates longer)
 # Optional:
@@ -90,8 +90,8 @@ jobs:
         with:
           oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
           oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
-          tags: tag:mac-qa
-          hostname: mac-qa-${{ github.run_id }}
+          tags: tag:claude-mac
+          hostname: claude-mac-${{ github.run_id }}
           args: --accept-dns=false --shields-up=false
           log-mode: quiet
 
@@ -111,7 +111,7 @@ jobs:
           dns=$("$TS" status --json 2>/dev/null | python3 -c 'import json,sys;print(json.load(sys.stdin)["Self"]["DNSName"].rstrip("."))' 2>/dev/null || true)
           [ -n "$ip4" ] && echo "::add-mask::$ip4"
           [ -n "$dns" ] && echo "::add-mask::$dns"
-          echo "Tailnet node is up (address masked). Find it in your Tailscale admin console as mac-qa-${{ github.run_id }}."
+          echo "Tailnet node is up (address masked). Find it in your Tailscale admin console as claude-mac-${{ github.run_id }}."
 
       - name: Enable Screen Sharing (VNC on 5900)
         env:
