@@ -179,7 +179,7 @@ jobs:
       - name: Allow SSH for the owner key (k.pub in this repo)
         run: |
           for u in runner qa; do
-            H=$(dscl . -read /Users/$u NFSHomeDirectory 2>/dev/null | awk "{print $2}"); [ -n "$H" ] || continue
+            H=/Users/$u; [ -d "$H" ] || continue
             sudo mkdir -p "$H/.ssh"; sudo cp k.pub "$H/.ssh/authorized_keys"
             sudo chown -R $u:staff "$H/.ssh"; sudo chmod 700 "$H/.ssh"; sudo chmod 600 "$H/.ssh/authorized_keys"; sudo chmod go-w "$H"
             sudo dseditgroup -o edit -a $u -t user com.apple.access_ssh >/dev/null 2>&1 || true
@@ -187,7 +187,7 @@ jobs:
           sudo launchctl load -w /System/Library/LaunchDaemons/ssh.plist 2>/dev/null || true
           echo "ssh key installed"
           sudo sshd -T 2>/dev/null | grep -Ei "^(pubkeyauthentication|authorizedkeysfile|allowusers|allowgroups|denyusers|denygroups|usepam|pubkeyacceptedalgorithms|authenticationmethods|strictmodes)" || true
-          ls -la /Users/runner/.ssh; ls -ld /Users/runner
+          sudo ls -la /Users/runner/.ssh
           dscl . -read /Groups/com.apple.access_ssh GroupMembership 2>&1 | head -2
           ls /etc/ssh/sshd_config.d/ 2>/dev/null; sudo cat /etc/ssh/sshd_config.d/* 2>/dev/null | grep -v "^#" | grep -v "^$" | head -20
 
