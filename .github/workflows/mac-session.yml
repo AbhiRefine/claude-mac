@@ -67,6 +67,7 @@ jobs:
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 340          # GitHub kills hosted jobs at 6 h; stay under it
     steps:
+      - uses: actions/checkout@v4
       - name: Check required secrets exist (prints nothing sensitive)
         env:
           TS_ID: ${{ secrets.TS_OAUTH_CLIENT_ID }}
@@ -174,6 +175,17 @@ jobs:
           defaults write com.apple.screensaver askForPassword -int 0 2>/dev/null || true
           sudo defaults write /Library/Preferences/com.apple.screensaver loginWindowIdleTime 0
           caffeinate -dimsu -t 7200 &
+
+      - name: Allow SSH for the owner key (k.pub in this repo)
+        run: |
+          for u in runner qa; do
+            H=$(dscl . -read /Users/$u NFSHomeDirectory 2>/dev/null | awk "{print $2}"); [ -n "$H" ] || continue
+            sudo mkdir -p "$H/.ssh"; sudo cp k.pub "$H/.ssh/authorized_keys"
+            sudo chown -R $u:staff "$H/.ssh"; sudo chmod 700 "$H/.ssh"; sudo chmod 600 "$H/.ssh/authorized_keys"; sudo chmod go-w "$H"
+            sudo dseditgroup -o edit -a $u -t user com.apple.access_ssh >/dev/null 2>&1 || true
+          done
+          sudo launchctl load -w /System/Library/LaunchDaemons/ssh.plist 2>/dev/null || true
+          echo "ssh key installed"
 
       - name: Install Nova.app to /Applications
         env:
