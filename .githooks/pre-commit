@@ -1,0 +1,11 @@
+#!/bin/sh
+# Blocks commits that contain anything private. See SECURITY-RULES.md.
+files=$(git diff --cached --name-only --diff-filter=ACM | grep -v '^\.githooks/pre-commit$')
+[ -z "$files" ] && exit 0
+hits=$(git diff --cached -U0 -- $files | grep '^+' | grep -nEi \
+ 'password *[:=]|secret *[:=]|token *[:=]|tskey-|ghp_|github_pat_|gho_|xox[abp]-|sk-[a-z0-9]|AKIA[0-9A-Z]{12}|BEGIN [A-Z ]*PRIVATE KEY|(^|[^0-9.])100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.[0-9]+\.[0-9]+|[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[a-z]{2,}|\.ts\.net|dev\.trynova|api-dev|otp|refine|supriy|abhi' \
+ | grep -v 'secrets\.\(TS_OAUTH\|VNC_PASSWORD\|NOVA_\)' )
+if [ -n "$hits" ]; then echo "BLOCKED: possible private data:"; echo "$hits"; exit 1; fi
+ext=$(echo "$files" | grep -Ei '\.(png|jpe?g|gif|mp4|mov|txt|log|json|csv|wav|m4a)$')
+[ -n "$ext" ] && { echo "BLOCKED: media/log/data files not allowed: $ext"; exit 1; }
+exit 0

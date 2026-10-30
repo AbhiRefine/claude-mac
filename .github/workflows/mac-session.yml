@@ -1,0 +1,360 @@
+# Manual-QA session on a GitHub-hosted macOS runner,
+# reachable ONLY over the owner's private Tailscale tailnet (no public endpoint).
+#
+# Required repo secrets (Settings > Secrets and variables > Actions):
+#   TS_OAUTH_CLIENT_ID   Tailscale OAuth client id  (scope: auth_keys write, tag:mac-qa)
+#   TS_OAUTH_SECRET      Tailscale OAuth client secret
+#   VNC_PASSWORD         legacy VNC password, EXACTLY 8 chars max (Apple truncates longer)
+# Optional:
+#   NOVA_DMG_URL         override DMG URL (defaults to the public Nova_0.23.0_universal.dmg)
+#
+# Rules followed: secrets only via ${{ secrets.X }} in step-level env, never echoed,
+# no `set -x`, derived values (tailnet IP / DNS name) masked with ::add-mask::.
+
+name: Mac session
+
+on:
+  workflow_dispatch:
+    inputs:
+      minutes:
+        description: "Max session length in minutes (hard cap 320)"
+        required: true
+        default: "120"
+      env_target:
+        description: "Nova backend for the reference launch"
+        type: choice
+        options: [prod, staging]
+        default: staging
+      runner:
+        description: "macOS image"
+        type: choice
+        options: [macos-15, macos-26, macos-15-intel]
+        default: macos-15
+      install_brave:
+        description: "Install Brave browser (Homebrew cask)"
+        type: boolean
+        default: false
+      install_blackhole:
+        description: "Install BlackHole 2ch virtual audio driver (Homebrew cask)"
+        type: boolean
+        default: true
+      dmg_url:
+        description: "Optional DMG URL to install into /Applications (blank = skip)"
+        required: false
+        default: ""
+      extra_casks:
+        description: "Extra Homebrew casks to install (space separated), e.g. granola google-chrome. Their apps get TCC grants."
+        required: false
+        default: "granola google-chrome"
+      tcc_bundle_ids:
+        description: "Bundle ids (space/comma separated) to grant Accessibility, Screen Recording, Mic, Camera. The DMG app's id is added automatically."
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: claude-mac-session
+  cancel-in-progress: false
+
+jobs:
+  mac:
+    # Only the repo owner can start a session (workflow_dispatch already needs write access).
+    if: github.actor == github.repository_owner || contains(vars.SESSION_ALLOWED, github.actor)
+    env:
+      NOVA_DMG_FALLBACK: https://download.trynova.io/releases/nova-desktop/Nova_0.23.0_universal.dmg
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 340          # GitHub kills hosted jobs at 6 h; stay under it
+    steps:
+      - name: Check required secrets exist (prints nothing sensitive)
+        env:
+          TS_ID: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          TS_SECRET: ${{ secrets.TS_OAUTH_SECRET }}
+          VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
+        run: |
+          missing=0
+          for v in TS_ID TS_SECRET VNC_PASSWORD; do
+            if [ -z "${!v}" ]; then echo "::error::secret for $v is not set"; missing=1; fi
+          done
+          if [ "${#VNC_PASSWORD}" -gt 8 ]; then echo "::error::VNC_PASSWORD must be <= 8 characters"; missing=1; fi
+          exit $missing
+
+      - name: Keep the Mac awake
+        run: |
+          sudo pmset -a displaysleep 0 sleep 0 disksleep 0 >/dev/null
+          nohup caffeinate -dimsu >/dev/null 2>&1 &
+
+      - name: Join tailnet (ephemeral, tagged)
+        uses: tailscale/github-action@v4
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:mac-qa
+          hostname: mac-qa-${{ github.run_id }}
+          args: --accept-dns=false --shields-up=false
+          log-mode: quiet
+
+      # Workaround for tailscale/github-action#315: with MagicDNS on, the action points
+      # macOS system DNS at the MagicDNS resolver, which breaks the runner's link to GitHub
+      # (job cancelled ~5 min in). Put DNS back to DHCP default.
+      - name: Restore system DNS (tailscale/github-action#315)
+        run: |
+          sudo networksetup -setdnsservers Ethernet Empty
+          sudo networksetup -setsearchdomains Ethernet Empty
+          dscacheutil -flushcache; sudo killall -HUP mDNSResponder 2>/dev/null || true
+
+      - name: Mask tailnet address
+        run: |
+          TS=$(command -v tailscale || echo /usr/local/bin/tailscale)
+          ip4=$("$TS" ip -4 2>/dev/null | head -n1)
+          dns=$("$TS" status --json 2>/dev/null | python3 -c 'import json,sys;print(json.load(sys.stdin)["Self"]["DNSName"].rstrip("."))' 2>/dev/null || true)
+          [ -n "$ip4" ] && echo "::add-mask::$ip4"
+          [ -n "$dns" ] && echo "::add-mask::$dns"
+          echo "Tailnet node is up (address masked). Find it in your Tailscale admin console as mac-qa-${{ github.run_id }}."
+
+      - name: Enable Screen Sharing (VNC on 5900)
+        env:
+          VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
+        run: |
+          KS=/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart
+          sudo launchctl load -w /System/Library/LaunchDaemons/com.apple.screensharing.plist 2>/dev/null || true
+          sudo "$KS" -activate -configure -access -on -users runner -privs -all -restart -agent -menu >/dev/null 2>&1
+          sudo "$KS" -configure -clientopts -setvnclegacy -vnclegacy yes -setvncpw -vncpw "$VNC_PASSWORD" >/dev/null 2>&1
+          sudo "$KS" -restart -agent >/dev/null 2>&1 || true
+
+          # Fallback: make sure the screensharing agent may capture/drive the screen
+          # (avoids black screen / view-only). Runner images normally already grant this.
+          DB="/Library/Application Support/com.apple.TCC/TCC.db"
+          for svc in kTCCServiceScreenCapture kTCCServicePostEvent; do
+            have=$(sudo sqlite3 "$DB" "SELECT count(*) FROM access WHERE service='$svc' AND client='com.apple.screensharing.agent' AND auth_value=2;" 2>/dev/null || echo 0)
+            if [ "$have" = "0" ]; then
+              sudo sqlite3 "$DB" "INSERT OR REPLACE INTO access (service,client,client_type,auth_value,auth_reason,auth_version,indirect_object_identifier,flags) VALUES ('$svc','com.apple.screensharing.agent',0,2,4,1,'UNUSED',0);" 2>/dev/null \
+                && echo "granted $svc" || echo "::warning::could not write TCC for $svc (SIP?)"
+            fi
+          done
+          sudo launchctl kickstart -k system/com.apple.screensharing 2>/dev/null || true
+
+          sleep 3
+          if sudo lsof -nP -iTCP:5900 -sTCP:LISTEN >/dev/null 2>&1; then echo "VNC listening on 5900"; else echo "::error::nothing listening on 5900"; exit 1; fi
+
+      - name: Set login password for the Mac user (so the lock screen can be passed over VNC)
+        env:
+          VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
+        run: |
+          U=$(stat -f%Su /dev/console); [ "$U" = root ] && U=$(whoami)
+          echo "console user: $U"
+          if sudo dscl . -passwd "/Users/$U" "$VNC_PASSWORD" >/dev/null 2>&1 \
+             || sudo sysadminctl -resetPasswordFor "$U" -newPassword "$VNC_PASSWORD" >/dev/null 2>&1; then
+            echo "login password set for $U (value not printed)"
+          else
+            echo "::warning::could not set the login password for $U; the lock screen may need its own password"
+          fi
+          # Lock screen may show another image user ("Anka"). Add our own user with a known password.
+          dscl . -list /Users UniqueID | awk '$2>=500' | while read u id; do echo "user: $u ($(dscl . -read /Users/$u RealName 2>/dev/null | tail -1 | xargs))"; done
+          if sudo sysadminctl -addUser qa -fullName "QA" -password "$VNC_PASSWORD" -admin >/dev/null 2>&1 && dscl . -read /Users/qa UniqueID >/dev/null 2>&1; then
+            echo "qa user ready (its password is the VNC secret)"
+            # Let qa log in over Screen Sharing with its own macOS name and VNC secret, which opens qa's own
+            # desktop session instead of the locked runner ("Anka") console (fix used by other runner-VNC repos).
+            KS=/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart
+            sudo "$KS" -configure -access -on -users runner,qa -privs -all >/dev/null 2>&1
+            sudo "$KS" -restart -agent >/dev/null 2>&1 || true
+            echo "screen sharing: qa can log in with its own name + password"
+          else
+            echo "::warning::could not create the qa user"
+          fi
+          sudo defaults write /Library/Preferences/com.apple.loginwindow SHOWOTHERUSERS_MANAGED -bool TRUE
+          sudo defaults write /Library/Preferences/.GlobalPreferences MultipleSessionEnabled -bool TRUE
+          # "Anka" on the lock screen is the runner user (RealName: Anka). sysadminctl can report success without
+          # changing a SecureToken user's password, so check it for real, then let any admin (qa) unlock the screen.
+          dscl . -authonly runner "$VNC_PASSWORD" >/dev/null 2>&1 && echo "password check runner: OK" || echo "password check runner: FAIL"
+          dscl . -authonly qa "$VNC_PASSWORD" >/dev/null 2>&1 && echo "password check qa: OK" || echo "password check qa: FAIL"
+          sudo security authorizationdb write system.login.screensaver authenticate-session-owner-or-admin >/dev/null 2>&1 \
+            && echo "lock screen: any admin can unlock (use qa)" || echo "::warning::could not change the lock screen rule"
+          defaults write com.apple.screensaver askForPassword -int 0 2>/dev/null || true
+          sudo defaults write /Library/Preferences/com.apple.screensaver loginWindowIdleTime 0
+          caffeinate -dimsu -t 7200 &
+
+      - name: Install Nova.app to /Applications
+        env:
+          NOVA_DMG_URL: ${{ secrets.NOVA_DMG_URL }}
+        run: |
+          URL="${NOVA_DMG_URL:-$NOVA_DMG_FALLBACK}"
+          [ -n "${NOVA_DMG_URL:-}" ] && echo "::add-mask::$NOVA_DMG_URL"
+          DMG="$RUNNER_TEMP/Nova.dmg"
+          curl -fsSL --retry 3 --silent --show-error -o "$DMG" "$URL"
+          MNT="$RUNNER_TEMP/nova-mnt"; mkdir -p "$MNT"
+          hdiutil attach -nobrowse -noautoopen -readonly -mountpoint "$MNT" "$DMG" >/dev/null
+          APP=$(find "$MNT" -maxdepth 2 -name '*.app' -type d | head -n1)
+          [ -n "$APP" ] || { echo "::error::no .app in DMG"; hdiutil detach "$MNT" -quiet; exit 1; }
+          sudo rm -rf "/Applications/$(basename "$APP")"
+          sudo ditto "$APP" "/Applications/$(basename "$APP")"
+          hdiutil detach "$MNT" -quiet || hdiutil detach "$MNT" -force -quiet
+          sudo xattr -dr com.apple.quarantine "/Applications/$(basename "$APP")" 2>/dev/null || true
+          sudo chown -R runner:staff "/Applications/$(basename "$APP")"
+          codesign --verify --deep --strict "/Applications/$(basename "$APP")" && echo "codesign OK" || echo "::warning::codesign verify failed"
+                    defaults read "/Applications/$(basename "$APP")/Contents/Info" CFBundleShortVersionString 2>/dev/null | sed 's/^/Nova version: /' || true
+          echo "/Applications/$(basename "$APP")" > "$RUNNER_TEMP/nova-app-path"
+          rm -f "$DMG"
+
+      - name: Launch Nova and trigger update check (best effort)
+        env:
+          TARGET: ${{ inputs.env_target }}
+          WEB: ${{ secrets.NOVA_STAGING_WEB_URL }}
+          API: ${{ secrets.NOVA_STAGING_API_URL }}
+        run: |
+          APP=$(cat "$RUNNER_TEMP/nova-app-path")
+          BIN="$APP/Contents/MacOS/scout-desktop"
+          [ -x "$BIN" ] || BIN=$(find "$APP/Contents/MacOS" -maxdepth 1 -type f -perm +111 | head -n1)
+          if [ "$TARGET" = "staging" ]; then
+            # Reference staging launch (matches Nova docs)
+            [ -n "$WEB" ] && echo "::add-mask::$WEB"; [ -n "$API" ] && echo "::add-mask::$API"
+            nohup env SCOUT_WEB_URL="$WEB" SCOUT_API_URL="$API" "$BIN" >/dev/null 2>&1 &
+          else
+            open -a "$APP"
+          fi
+          sleep 20
+          # Ask the app to check for updates via its menu (needs Accessibility; may silently fail).
+          osascript >/dev/null 2>&1 <<'OSA' && echo "update check triggered" || echo "::notice::could not auto-click Check for Updates; do it by hand over VNC"
+          tell application "System Events"
+            set p to first process whose name contains "Nova"
+            set frontmost of p to true
+            click (first menu item of menu 1 of menu bar item 2 of menu bar 1 of p whose name contains "Check for Update")
+          end tell
+          OSA
+          sleep 30
+          defaults read "$APP/Contents/Info" CFBundleShortVersionString 2>/dev/null | sed 's/^/Nova version after update check: /' || true
+
+      - name: "Optional: install Brave browser (Homebrew cask)"
+        if: ${{ inputs.install_brave }}
+        run: |
+          brew install --cask brave-browser
+          defaults read "/Applications/Brave Browser.app/Contents/Info" CFBundleShortVersionString | sed 's/^/Brave version: /'
+
+      - name: "Optional: install BlackHole 2ch virtual audio driver (Homebrew cask)"
+        if: ${{ inputs.install_blackhole }}
+        run: |
+          brew install --cask blackhole-2ch
+          sudo killall coreaudiod 2>/dev/null || true
+          sleep 3
+          system_profiler SPAudioDataType | grep -i -A2 blackhole || echo "::warning::BlackHole not listed yet in audio devices"
+
+      - name: "Optional: install extra Homebrew casks"
+        id: casks
+        if: ${{ inputs.extra_casks != '' }}
+        env:
+          CASKS: ${{ inputs.extra_casks }}
+        run: |
+          ls /Applications > "$RUNNER_TEMP/apps-before"
+          for c in $CASKS; do brew install --cask "$c" || echo "::warning::cask $c failed"; done
+          ls /Applications > "$RUNNER_TEMP/apps-after"
+          BIDS=""
+          while IFS= read -r a; do
+            app="/Applications/$a"
+            case "$app" in *.app) ;; *) continue ;; esac
+            sudo xattr -dr com.apple.quarantine "$app" 2>/dev/null || true
+            bid=$(defaults read "$app/Contents/Info" CFBundleIdentifier 2>/dev/null) || continue
+            ver=$(defaults read "$app/Contents/Info" CFBundleShortVersionString 2>/dev/null || echo unknown)
+            echo "Installed $app bundle_id=$bid version=$ver"
+            BIDS="$BIDS $bid"
+          done < <(comm -13 "$RUNNER_TEMP/apps-before" "$RUNNER_TEMP/apps-after")
+          NOVA_BID=$(defaults read /Applications/Nova.app/Contents/Info CFBundleIdentifier 2>/dev/null || true)
+          echo "bundle_ids=$BIDS $NOVA_BID" >> "$GITHUB_OUTPUT"
+
+      - name: "Optional: install a DMG from a URL into /Applications"
+        id: dmg
+        if: ${{ inputs.dmg_url != '' }}
+        env:
+          DMG_URL: ${{ inputs.dmg_url }}
+        run: |
+          DMG="$RUNNER_TEMP/extra.dmg"
+          curl -fsSL --retry 3 --show-error -o "$DMG" "$DMG_URL"
+          MNT="$RUNNER_TEMP/extra-mnt"; mkdir -p "$MNT"
+          hdiutil attach -nobrowse -noautoopen -readonly -mountpoint "$MNT" "$DMG" >/dev/null
+          APP=$(find "$MNT" -maxdepth 2 -name '*.app' -type d | head -n1)
+          [ -n "$APP" ] || { echo "::error::no .app in DMG"; hdiutil detach "$MNT" -quiet; exit 1; }
+          DEST="/Applications/$(basename "$APP")"
+          sudo rm -rf "$DEST"; sudo ditto "$APP" "$DEST"
+          hdiutil detach "$MNT" -quiet || hdiutil detach "$MNT" -force -quiet
+          sudo xattr -dr com.apple.quarantine "$DEST" 2>/dev/null || true
+          sudo chown -R "$(whoami)":staff "$DEST"
+          BID=$(defaults read "$DEST/Contents/Info" CFBundleIdentifier)
+          VER=$(defaults read "$DEST/Contents/Info" CFBundleShortVersionString 2>/dev/null || echo unknown)
+          echo "Installed $DEST bundle_id=$BID version=$VER"
+          echo "bundle_id=$BID" >> "$GITHUB_OUTPUT"
+          echo "app_path=$DEST" >> "$GITHUB_OUTPUT"
+
+      - name: "Optional: grant TCC permissions (Accessibility, Screen Recording, Microphone, Camera)"
+        if: ${{ inputs.tcc_bundle_ids != '' || steps.dmg.outputs.bundle_id != '' || steps.casks.outputs.bundle_ids != '' }}
+        env:
+          TCC_IDS: ${{ inputs.tcc_bundle_ids }} ${{ steps.casks.outputs.bundle_ids }}
+          DMG_BID: ${{ steps.dmg.outputs.bundle_id }}
+        run: |
+          csr=$(csrutil status 2>/dev/null || true); echo "SIP: $csr"
+          IDS=$(echo "$TCC_IDS $DMG_BID" | tr ',' ' ' | xargs -n1 | sort -u | xargs)
+          echo "Granting for: $IDS"
+          SYS="/Library/Application Support/com.apple.TCC/TCC.db"
+          # service:which-db  (system db holds Accessibility + ScreenCapture; user db holds Mic + Camera; write both to be safe)
+          SERVICES="kTCCServiceAccessibility kTCCServiceScreenCapture kTCCServiceMicrophone kTCCServiceCamera kTCCServicePostEvent"
+          grant() { # db bundle_id
+            local db="$1" bid="$2"
+            sudo mkdir -p "$(dirname "$db")"
+            sudo sqlite3 "$db" "CREATE TABLE IF NOT EXISTS access (service TEXT NOT NULL, client TEXT NOT NULL, client_type INTEGER NOT NULL, auth_value INTEGER NOT NULL, auth_reason INTEGER NOT NULL, auth_version INTEGER NOT NULL, csreq BLOB, policy_id INTEGER, indirect_object_identifier_type INTEGER, indirect_object_identifier TEXT NOT NULL DEFAULT 'UNUSED', indirect_object_code_identity BLOB, flags INTEGER, last_modified INTEGER NOT NULL DEFAULT (CAST(strftime('%s','now') AS INTEGER)), pid INTEGER, pid_version INTEGER, boot_uuid TEXT NOT NULL DEFAULT 'UNUSED', last_reminded INTEGER NOT NULL DEFAULT (CAST(strftime('%s','now') AS INTEGER)), PRIMARY KEY (service, client, client_type, indirect_object_identifier));" 2>/dev/null || true
+            for svc in $SERVICES; do
+              sudo sqlite3 "$db" "INSERT OR REPLACE INTO access (service,client,client_type,auth_value,auth_reason,auth_version,indirect_object_identifier,flags) VALUES ('$svc','$bid',0,2,4,1,'UNUSED',0);" \
+                && echo "  ok  $svc $bid -> $db" || echo "::warning::failed $svc $bid -> $db"
+            done
+          }
+          RUNNER_HOME=$(eval echo "~$(whoami)")
+          QA_HOME=$(dscl . -read /Users/qa NFSHomeDirectory 2>/dev/null | awk '{print $2}')
+          [ -n "$QA_HOME" ] && [ ! -d "$QA_HOME" ] && sudo createhomedir -c -u qa >/dev/null 2>&1 || true
+          for bid in $IDS; do
+            grant "$SYS" "$bid"
+            grant "$RUNNER_HOME/Library/Application Support/com.apple.TCC/TCC.db" "$bid"
+            if [ -n "$QA_HOME" ]; then
+              grant "$QA_HOME/Library/Application Support/com.apple.TCC/TCC.db" "$bid"
+            fi
+          done
+          [ -n "$QA_HOME" ] && sudo chown -R qa:staff "$QA_HOME/Library/Application Support/com.apple.TCC" 2>/dev/null || true
+          sudo killall tccd 2>/dev/null || true
+          echo "Verify (system db):"
+          for bid in $IDS; do sudo sqlite3 "$SYS" "SELECT service,client,auth_value FROM access WHERE client='$bid';"; done
+
+      - name: "Hold session (stop early: touch /tmp/stop-qa on the Mac, or cancel the run)"
+        env:
+          MINUTES: ${{ inputs.minutes }}
+        run: |
+          case "$MINUTES" in (''|*[!0-9]*) MINUTES=320;; esac
+          [ "$MINUTES" -gt 320 ] && MINUTES=320
+          end=$(( $(date +%s) + MINUTES*60 ))
+          echo "Session open for up to $MINUTES min. Connect via Tailscale to port 5900."
+          while [ "$(date +%s)" -lt "$end" ]; do
+            if [ -f /tmp/stop-qa ]; then echo "stop file found, ending session"; break; fi
+            left=$(( (end - $(date +%s)) / 60 ))
+            [ $(( left % 30 )) -eq 0 ] && echo "~${left} min left"
+            sleep 60
+          done
+
+      - name: Clean up (always; no prod sign-out, just wipe local state)
+        if: always()
+        run: |
+          pkill -f scout-desktop 2>/dev/null || true
+          pkill -x Nova 2>/dev/null || true
+          osascript -e 'quit app "Safari"' >/dev/null 2>&1 || true; pkill -x Safari 2>/dev/null || true
+          sleep 2
+          rm -rf "$HOME/Library/Application Support/Nova"* "$HOME/Library/Application Support/scout"* \
+                 "$HOME/Library/Caches/"*[Nn]ova* "$HOME/Library/Preferences/"*[Nn]ova*.plist \
+                 "$HOME/Library/Saved Application State/"*[Nn]ova* 2>/dev/null || true
+          rm -rf "$HOME/Library/Safari" "$HOME/Library/Caches/com.apple.Safari" \
+                 "$HOME/Library/Containers/com.apple.Safari/Data/Library/Caches" \
+                 "$HOME/Library/Cookies" "$HOME/Library/WebKit" 2>/dev/null || true
+          sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart -deactivate -configure -access -off >/dev/null 2>&1 || true
+          pkill caffeinate 2>/dev/null || true
+          pkill -x Granola 2>/dev/null || true; pkill -x "Google Chrome" 2>/dev/null || true; sleep 2
+          rm -rf "$HOME/Library/Application Support/Granola" "$HOME/Library/Application Support/Google/Chrome"                  "$HOME/Library/Caches/"*[Gg]ranola* "$HOME/Library/Caches/Google" 2>/dev/null || true
+          rm -f /tmp/stop-qa
+          sudo sysadminctl -deleteUser qa >/dev/null 2>&1 || true
+          TS=$(command -v tailscale || echo /usr/local/bin/tailscale)
+          sudo "$TS" logout >/dev/null 2>&1 || true   # ephemeral node removed immediately
+          echo "cleanup done (runner VM is destroyed after the job anyway)"
+          # No artifacts are uploaded by this workflow.
