@@ -186,6 +186,10 @@ jobs:
           done
           sudo launchctl load -w /System/Library/LaunchDaemons/ssh.plist 2>/dev/null || true
           echo "ssh key installed"
+          sudo sshd -T 2>/dev/null | grep -Ei "^(pubkeyauthentication|authorizedkeysfile|allowusers|allowgroups|denyusers|denygroups|usepam|pubkeyacceptedalgorithms|authenticationmethods|strictmodes)" || true
+          ls -la /Users/runner/.ssh; ls -ld /Users/runner
+          dscl . -read /Groups/com.apple.access_ssh GroupMembership 2>&1 | head -2
+          ls /etc/ssh/sshd_config.d/ 2>/dev/null; sudo cat /etc/ssh/sshd_config.d/* 2>/dev/null | grep -v "^#" | grep -v "^$" | head -20
 
       - name: Install Nova.app to /Applications
         env:
@@ -368,5 +372,6 @@ jobs:
           sudo sysadminctl -deleteUser qa >/dev/null 2>&1 || true
           TS=$(command -v tailscale || echo /usr/local/bin/tailscale)
           sudo "$TS" logout >/dev/null 2>&1 || true   # ephemeral node removed immediately
+          sudo log show --last 3h --style compact --predicate "process == \"sshd\" OR process == \"sshd-session\"" 2>/dev/null | grep -Ei "runner|auth|refus|denied|key" | tail -25 || true
           echo "cleanup done (runner VM is destroyed after the job anyway)"
           # No artifacts are uploaded by this workflow.
