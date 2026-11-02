@@ -55,7 +55,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: claude-mac-session
+  group: claude-mac-session-${{ github.run_id }}
   cancel-in-progress: false
 
 jobs:
